@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -22,8 +24,8 @@ type PackageConfig struct {
 func main() {
 	r := gin.Default()
 
-	// Define the /os-release endpoint
-	r.GET("/os-release", func(c *gin.Context) {
+	// Define the /os endpoint
+	r.GET("/os", func(c *gin.Context) {
 		data, err := readOSReleaseFile("/etc/os-release")
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Unable to read /etc/os-release file"})
@@ -57,9 +59,9 @@ func main() {
 		// Prepare the systemctl command based on the request
 		var cmd *exec.Cmd
 		if request.Failed {
-			cmd = exec.Command("systemctl", "status", "--failed", "--nop-pager", "--output", "json")
+			cmd = exec.Command("systemctl", "status", "--failed", "--no-pager")
 		} else {
-			cmd = exec.Command("systemctl", "status", "--no-pager", "--output", "json")
+			cmd = exec.Command("systemctl", "status", "--no-pager")
 		}
 
 		// Execute the command
@@ -143,8 +145,184 @@ func main() {
 		})
 	})
 
+	// Define the /packages GET endpoint that returns a list of installed packages
+	r.GET("/packages", func(c *gin.Context) {
+		osReleaseData, err := readOSReleaseFile("/etc/os-release")
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Unable to determine the operating system"})
+			return
+		}
+
+		var cmd *exec.Cmd
+		switch osReleaseData["ID"] {
+		case "ubuntu", "debian":
+			cmd = exec.Command("dpkg-query", "-W", "-f=${binary:Package}\n")
+		case "fedora", "centos", "rhel":
+			cmd = exec.Command("dnf", "list", "installed")
+		default:
+			c.JSON(400, gin.H{"error": "Unsupported operating system"})
+			return
+		}
+
+		output, err := cmd.Output()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to get installed packages", "output": err.Error()})
+			return
+		}
+
+		// Parse the output into a list of packages
+		packageList := strings.Split(strings.TrimSpace(string(output)), "\n")
+		c.JSON(200, gin.H{"installed_packages": packageList})
+	})
+
+	// Define the /binaries endpoint to count binaries in $PATH
+	r.GET("/binaries", func(c *gin.Context) {
+		// Get the $PATH environment variable
+		pathEnv := os.Getenv("PATH")
+		if pathEnv == "" {
+			c.JSON(500, gin.H{"error": "$PATH environment variable is empty"})
+			return
+		}
+
+		// Split $PATH into directories
+		dirs := strings.Split(pathEnv, ":")
+
+		// Count binaries in each directory
+		binaryCount := 0
+		for _, dir := range dirs {
+			files, err := os.ReadDir(dir)
+			if err != nil {
+				continue // Skip directories we can't read
+			}
+			for _, file := range files {
+				// Check if it's an executable file
+				if !file.IsDir() {
+					pathToFile := filepath.Join(dir, file.Name())
+					if isExecutable(pathToFile) {
+						binaryCount++
+					}
+				}
+			}
+		}
+
+		c.JSON(200, gin.H{"binary_count": binaryCount})
+	})
+
+	// Define the /kubernetes GET endpoint to check if Kubernetes is installed
+	r.GET("/kubernetes", func(c *gin.Context) {
+		isInstalled := checkKubernetesInstallation()
+		c.JSON(200, gin.H{
+			"installed": isInstalled,
+		})
+	})
+
+	// Define the /kubernetes POST endpoint
+	r.POST("/kubernetes", func(c *gin.Context) {
+		output, err := installAndBootstrapKubernetes()
+		if err != nil {
+			c.JSON(500, gin.H{
+				"error":   "Failed to install and bootstrap Kubernetes",
+				"details": err.Error(),
+				"output":  output,
+			})
+			return
+		}
+		c.JSON(200, gin.H{
+			"message": "Kubernetes successfully installed and bootstrapped",
+			"output":  output,
+		})
+	})
+
 	// Start the Gin server
-	r.Run() // Default runs on :8080
+	r.Run(":80") // Default runs on :8080
+}
+
+// Function to check if Kubernetes is installed on the system
+func checkKubernetesInstallation() bool {
+	// Check if kubeadm is installed
+	_, errKubeadm := exec.LookPath("kubeadm")
+	// Check if kubectl is installed
+	_, errKubectl := exec.LookPath("kubectl")
+	// Check if kubelet is installed
+	_, errKubelet := exec.LookPath("kubelet")
+
+	// If all are installed, return true
+	if errKubeadm == nil && errKubectl == nil && errKubelet == nil {
+		return true
+	}
+
+	// Otherwise, return false
+	return false
+}
+
+// Function to install and bootstrap Kubernetes on Ubuntu
+func installAndBootstrapKubernetes() (string, error) {
+	var outputBuffer bytes.Buffer
+
+	// Commands to install Kubernetes dependencies
+	commands := []string{
+		// Update and install dependencies
+		"sudo apt-get update",
+		"sudo apt-get install -y apt-transport-https ca-certificates curl",
+		"curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -",
+		`sudo bash -c 'cat <<EOF >/etc/apt/sources.list.d/kubernetes.list
+deb https://apt.kubernetes.io/ kubernetes-xenial main
+EOF'`,
+		"sudo apt-get update",
+
+		// Install kubeadm, kubelet, and kubectl
+		"sudo apt-get install -y kubelet kubeadm kubectl",
+
+		// Disable swap
+		"sudo swapoff -a",
+
+		// Initialize the Kubernetes cluster with kubeadm
+		"sudo kubeadm init",
+
+		// Setup kubectl for the ubuntu user
+		"mkdir -p $HOME/.kube",
+		"sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config",
+		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
+
+		// Install a pod network (flannel or weave)
+		"kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml",
+	}
+
+	// Execute each command and collect the output
+	for _, cmd := range commands {
+		fmt.Printf("Running command: %s\n", cmd) // Print command being executed
+		log.Printf("Executing: %s", cmd)
+		if err := execCommand(cmd, &outputBuffer); err != nil {
+			fmt.Printf("Error during command execution: %s\n", err)
+			return outputBuffer.String(), fmt.Errorf("failed to execute: %s", cmd)
+		}
+	}
+
+	return outputBuffer.String(), nil
+}
+
+// Helper function to execute a shell command and capture its output
+func execCommand(cmd string, outputBuffer *bytes.Buffer) error {
+	command := exec.Command("bash", "-c", cmd)
+	command.Stdout = outputBuffer
+	command.Stderr = outputBuffer
+
+	// Execute the command and capture stdout/stderr
+	err := command.Run()
+
+	// Print the output to the application stdout
+	fmt.Printf("Output of command '%s':\n%s\n", cmd, outputBuffer.String())
+	return err
+}
+
+// Helper function to check if a file is executable
+func isExecutable(filePath string) bool {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return false
+	}
+	mode := info.Mode()
+	return mode&0111 != 0 // Check if any of the execute bits are set
 }
 
 // Function to read and parse the /etc/os-release file
